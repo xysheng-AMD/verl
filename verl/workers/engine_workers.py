@@ -211,6 +211,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
         final_metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
         final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
+        # 本次 forward/backward micro-batch 循环内的 reserved 峰值（每个 micro-batch empty_cache 之前采样）
+        last_micro_batch_max_reserved = getattr(self.engine, "_last_micro_batch_max_reserved_bytes", None)
+        if last_micro_batch_max_reserved is not None:
+            final_metrics["perf/micro_batch_max_reserved_gb"] = last_micro_batch_max_reserved / (1024**3)
+
         # TODO: confirm the mtp loss IS same across dp
         for k, v in final_metrics.items():
             if k.startswith("mtp_losses"):

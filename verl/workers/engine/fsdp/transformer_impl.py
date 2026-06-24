@@ -38,7 +38,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -638,6 +638,13 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
+        # 每个 micro-batch 后 empty_cache + 跟踪 reserved 高水位。
+        # 由环境变量 VERL_EMPTY_CACHE_PER_MICRO_BATCH 控制（默认 "1" 开启）。
+        device = get_torch_device()
+        empty_cache_per_micro_batch = os.getenv("VERL_EMPTY_CACHE_PER_MICRO_BATCH", "1") == "1"
+        device_available = device.is_available()
+        max_reserved_bytes = 0
+
         for micro_batch in micro_batches:
             with ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
@@ -648,7 +655,17 @@ class FSDPEngine(BaseEngine):
                     else:
                         loss.backward()
 
+            if device_available:
+                max_reserved_bytes = max(max_reserved_bytes, device.memory_reserved())
+                if empty_cache_per_micro_batch:
+                    device.synchronize()
+                    device.empty_cache()
+
             output_lst.append(meta_info)
+
+        if device_available:
+            max_reserved_bytes = max(max_reserved_bytes, device.max_memory_reserved())
+        self._last_micro_batch_max_reserved_bytes = max_reserved_bytes
 
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
