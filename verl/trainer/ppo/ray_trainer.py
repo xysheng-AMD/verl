@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -71,6 +72,25 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _atom_agent_log(event: str, **fields):
+    path = os.getenv("VERL_ATOM_AGENT_LOG") or os.getenv("VERL_MEMORY_AGENT_LOG")
+    if not path:
+        return
+    try:
+        payload = {
+            "tag": "ATOM_DIAG",
+            "event": event,
+            "ts": time.time(),
+            "pid": os.getpid(),
+            **fields,
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+    except Exception:
+        pass
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -596,7 +616,23 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
+    def _reset_atom_deferred_state(self, reason: str):
+        """Reset ATOM deferred token/logprob state at rollout phase boundaries."""
+        rollout_name = self.config.actor_rollout_ref.rollout.get("name", "")
+        if rollout_name != "atom" or not hasattr(self, "llm_server_manager"):
+            return
+        print(f"validation reset_deferred_state: {reason}")
+        _atom_agent_log("trainer_reset_deferred_state", reason=reason, global_steps=self.global_steps)
+        self.llm_server_manager.reset_deferred_state()
+
     def _validate(self, merged: bool = False):
+        self._reset_atom_deferred_state("before_validation")
+        try:
+            return self._validate_impl(merged=merged)
+        finally:
+            self._reset_atom_deferred_state("after_validation")
+
+    def _validate_impl(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
