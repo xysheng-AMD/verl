@@ -541,6 +541,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             self.ref = TrainingWorker(config=ref_training_config)
             self.ref.reset()
+            # Apply Lumen FP8 inference-only patch to ref model
+            import os
+            if os.environ.get("LUMEN_REF_FP8", "0") == "1":
+                print(f"[verl-ref] Applying Lumen FP8 to ref model (module type: {type(self.ref.engine.module).__name__})", flush=True)
+                from verl.utils.fsdp_utils import _maybe_apply_lumen
+                _maybe_apply_lumen(self.ref.engine.module, forward_only=True)
+            else:
+                print(f"[verl-ref] LUMEN_REF_FP8 not set, skipping ref FP8 patch", flush=True)
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
         # 2. build actor model

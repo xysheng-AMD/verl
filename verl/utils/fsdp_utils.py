@@ -556,6 +556,88 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
     return modules
 
 
+def _maybe_apply_lumen(model, forward_only=False):
+    """Apply Lumen FP8/norm/attn optimizations if LUMEN env vars are set."""
+    import os
+    if os.environ.get("LUMEN_FP8", "0") != "1" and not os.environ.get("LUMEN_ROLLOUT"):
+        return
+    try:
+        from lumen.rl.verl.config import VerlLumenArgs
+        from lumen.config import LumenConfig
+        lumen_args = VerlLumenArgs(
+            model_name_or_path=os.environ.get("MODEL_NAME", ""),
+            linear_fp8=os.environ.get("LUMEN_FP8", "0") == "1",
+            linear_fp8_format=os.environ.get("LUMEN_FP8_FORMAT", "fp8_e4m3"),
+            linear_fp8_scaling=os.environ.get("LUMEN_FP8_SCALING", "delayed"),
+            linear_fp8_block_size=int(os.environ.get("LUMEN_FP8_BLOCK_SIZE", "128")),
+            lumen_norm=os.environ.get("LUMEN_NORM", "0") == "1",
+            lumen_fp8_attn=os.environ.get("LUMEN_FP8_ATTN", "none"),
+            lumen_fp8_quant_type=os.environ.get("LUMEN_FP8_QUANT_TYPE", "blockwise"),
+            lumen_attn_backend=os.environ.get("LUMEN_ATTN_BACKEND", "auto"),
+            lumen_fp8_weight_cache=os.environ.get("LUMEN_FP8_WEIGHT_CACHE", "0") == "1",
+            lumen_fp8_activation_store=os.environ.get("LUMEN_FP8_ACTIVATION_STORE", "0") == "1",
+            lumen_fp8_param_gather=os.environ.get("LUMEN_FP8_PARAM_GATHER", "0") == "1",
+            lumen_rollout=os.environ.get("LUMEN_ROLLOUT", ""),
+            fp8_param_manager=os.environ.get("FP8_PARAM_MANAGER", "0") == "1",
+            use_8bit_adam=os.environ.get("USE_8BIT_ADAM", "0") == "1",
+        )
+        if forward_only and os.environ.get("LUMEN_REF_FP8", "0") != "1":
+            return
+        cfg = LumenConfig.from_args(lumen_args)
+        if os.environ.get("AITER_ATTN", "0") == "1":
+            cfg.hf_attn_patch = True
+        if os.environ.get("FUSE_ROPE", "0") == "1":
+            cfg.fused_rope = True
+        cfg.enable(model)
+        import torch.nn as nn
+        for name, mod in model.named_modules():
+            if isinstance(mod, nn.Linear) and "lm_head" in name:
+                if hasattr(mod, '_quant_enabled'):
+                    mod._quant_enabled = False
+                    mod.forward = nn.Linear.forward.__get__(mod, nn.Linear)
+                    print(f"[verl] Restored {name} to BF16 (CK blockscale GEMM INT32 overflow)", flush=True)
+        if forward_only:
+            _strip_fp8_autograd(model, lumen_args)
+        label = "ref/inference-only" if forward_only else "actor/full"
+        print(f"[verl] Lumen optimizations applied ({label}) before FSDP2 wrapping", flush=True)
+    except Exception as e:
+        print(f"[verl] WARNING: Lumen apply failed: {e}", flush=True)
+
+
+def _strip_fp8_autograd(model, lumen_args):
+    """Re-patch quantized linears with inference-only FP8 forward.
+
+    After cfg.enable() patches nn.Linear with QuantizedLinearFunction (autograd),
+    this replaces those forwards with a lightweight version that does the same
+    quantize_input + dispatch_gemm but without ctx.save_for_backward overhead.
+    """
+    import torch.nn as nn
+    from lumen.ops.quantize.linear import quantize_input, dispatch_gemm
+    from lumen.ops.quantize.ops import _auto_fp8_dtype
+
+    fp8_dtype = _auto_fp8_dtype()
+    block_size = lumen_args.linear_fp8_block_size
+    scaling_type = lumen_args.linear_fp8_scaling
+
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            def _make_fp8_infer_fwd(mod):
+                def _fwd(x):
+                    orig_shape = x.shape
+                    x_2d = x.reshape(-1, orig_shape[-1])
+                    act_desc = quantize_input(x_2d, scaling_type, fp8_dtype, block_size)
+                    w = mod.weight
+                    w_2d = w if w.is_contiguous() else w.contiguous()
+                    w_desc = quantize_input(w_2d, scaling_type, fp8_dtype, block_size, is_weight=True)
+                    out = dispatch_gemm(act_desc, w_desc, scaling_type=scaling_type, bias=mod.bias)
+                    return out.reshape(*orig_shape[:-1], out.shape[-1])
+                return _fwd
+            module.forward = _make_fp8_infer_fwd(module)
+            count += 1
+    print(f"[verl] FP8 autograd stripped: {count} nn.Linear -> inference-only", flush=True)
+
+
 def apply_fsdp2(model, fsdp_kwargs, config):
     """model: AutoModelForCausalLM"""
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"

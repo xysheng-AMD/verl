@@ -541,6 +541,7 @@ class FSDPEngine(BaseEngine):
         logger.info(f"[QAT W4A4] Restored {loaded_count} input_global_scale/input_amax from {model_path}")
 
     def _build_model_optimizer(self):
+        print(f"[verl-debug] _build_model_optimizer called, strategy={self.engine_config.strategy} forward_only={getattr(self.engine_config, 'forward_only', 'N/A')}", flush=True)
         from verl.utils.model import print_model_size
 
         # Load base model with specified configuration and dtype
@@ -558,6 +559,10 @@ class FSDPEngine(BaseEngine):
         if self.rank == 0:
             print_model_size(module)
         log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
+
+        # Apply Lumen FP8 optimizations before FSDP wrapping
+        from verl.utils.fsdp_utils import _maybe_apply_lumen
+        _maybe_apply_lumen(module, forward_only=getattr(self.engine_config, "forward_only", False))
 
         # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
         log_gpu_memory_usage("Before FSDP", logger=None)
@@ -1125,7 +1130,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                                 v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
             else:
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                logits_rmpad = output.logits.squeeze(0).clone()  # (total_nnz, vocab_size)
                 logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
