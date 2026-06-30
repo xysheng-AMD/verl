@@ -39,7 +39,7 @@ from verl.utils.device import get_resource_name, get_visible_devices_keyword, is
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
-from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
+from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, apply_vllm_fp8_per_block_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
@@ -883,8 +883,8 @@ class vLLMHttpServer:
             logger.info(f"QAT quantization config injected (quant_method={quant_method})")
             hf_overrides["quantization_config"] = quantization_config_dict
         elif quantization is not None:
-            # Handle other quantization methods (fp8, torchao)
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
+            # Handle other quantization methods (fp8, fp8_per_block, torchao)
+            _SUPPORTED_QUANTIZATION = ["fp8", "fp8_per_block", "torchao", "ascend"]
             if quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
 
@@ -907,6 +907,11 @@ class vLLMHttpServer:
                 apply_vllm_fp8_patches()
                 # for subprocesses patching
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
+            elif quantization == "fp8_per_block":
+                os.environ.pop("VERL_VLLM_FP8_QUANT_ENABLED", None)
+                apply_vllm_fp8_per_block_patches()
+                # for spawned vLLM worker subprocesses patching
+                os.environ["VERL_VLLM_FP8_PER_BLOCK_PATCH_ENABLED"] = "1"
 
         if quantization is not None and self.config.quantization_config_file is not None:
             hf_overrides["quantization_config_file"] = self.config.quantization_config_file

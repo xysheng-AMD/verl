@@ -211,6 +211,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
         final_metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
         final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
+        # 本次 forward/backward micro-batch 循环内的 reserved 峰值（每个 micro-batch empty_cache 之前采样）
+        last_micro_batch_max_reserved = getattr(self.engine, "_last_micro_batch_max_reserved_bytes", None)
+        if last_micro_batch_max_reserved is not None:
+            final_metrics["perf/micro_batch_max_reserved_gb"] = last_micro_batch_max_reserved / (1024**3)
+
         # TODO: confirm the mtp loss IS same across dp
         for k, v in final_metrics.items():
             if k.startswith("mtp_losses"):
@@ -536,6 +541,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             self.ref = TrainingWorker(config=ref_training_config)
             self.ref.reset()
+            # Apply Lumen FP8 inference-only patch to ref model
+            import os
+            if os.environ.get("LUMEN_REF_FP8", "0") == "1":
+                print(f"[verl-ref] Applying Lumen FP8 to ref model (module type: {type(self.ref.engine.module).__name__})", flush=True)
+                from verl.utils.fsdp_utils import _maybe_apply_lumen
+                _maybe_apply_lumen(self.ref.engine.module, forward_only=True)
+            else:
+                print(f"[verl-ref] LUMEN_REF_FP8 not set, skipping ref FP8 patch", flush=True)
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
         # 2. build actor model

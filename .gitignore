@@ -131,3 +131,7 @@ logs
 log
 outputs
 .history
+
+# atom rollout / fp8 runtime artifacts
+.fp8bak/
+online_quant_info_*.json

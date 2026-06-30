@@ -363,6 +363,16 @@ class LLMServerManager:
         return self.rollout_replicas
 
     @auto_await
+    async def clear_kv_cache(self):
+        """Clear rollout kv cache without sleeping replicas."""
+        await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
+
+    @auto_await
+    async def reset_deferred_state(self):
+        """Reset backend-specific deferred generation state on all rollout replicas."""
+        await asyncio.gather(*[replica.reset_deferred_state() for replica in self.rollout_replicas])
+
+    @auto_await
     async def start_profile(self, **kwargs):
         """Start profiling on all rollout replicas."""
         await asyncio.gather(*[replica.start_profile(**kwargs) for replica in self.rollout_replicas])

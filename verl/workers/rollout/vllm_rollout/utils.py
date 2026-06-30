@@ -27,7 +27,15 @@ from vllm.outputs import RequestOutput
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+from verl.utils.vllm.vllm_fp8_utils import (
+    apply_vllm_fp8_patches,
+    apply_vllm_fp8_per_block_patches,
+    finalize_online_quantized_weights_loading,
+    is_fp8_model,
+    is_online_quant_model,
+    load_quanted_weights,
+    prepare_online_quantized_weights_for_loading,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -125,6 +133,8 @@ class vLLMColocateWorkerExtension:
         # 2. patch online fp8 quant
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1":
             apply_vllm_fp8_patches()
+        if os.environ.get("VERL_VLLM_FP8_PER_BLOCK_PATCH_ENABLED", "0") == "1":
+            apply_vllm_fp8_per_block_patches()
         # 3. patch QAT (compressed-tensors NVFP4) for dynamic weight loading
         vllm_config = kwargs.get("vllm_config")
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
@@ -207,8 +217,11 @@ class vLLMColocateWorkerExtension:
         if peft_config and base_sync_done:
             self.remove_lora(VLLM_LORA_INT_ID)
 
-        use_standard_weight_load = not (peft_config and base_sync_done) and not is_fp8_model(
-            self.model_runner.vllm_config
+        is_online_quant = is_online_quant_model(self.model_runner.vllm_config)
+        use_standard_weight_load = (
+            not (peft_config and base_sync_done)
+            and not is_fp8_model(self.model_runner.vllm_config)
+            and not is_online_quant
         )
 
         if self._is_qat_model:
@@ -223,6 +236,10 @@ class vLLMColocateWorkerExtension:
 
             prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
             logger.info("ModelOpt: prepare_modelopt_for_weight_reload completed")
+        elif is_online_quant:
+            for model in self._iter_all_models():
+                prepare_online_quantized_weights_for_loading(model)
+            logger.info("Online quantization: prepare layerwise reload completed")
         elif use_standard_weight_load:
             # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
             for model in self._iter_all_models():
@@ -252,6 +269,10 @@ class vLLMColocateWorkerExtension:
 
             modelopt_process_weights_after_loading(self.model_runner.model)
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
+        elif is_online_quant:
+            for model, model_config in self._iter_all_models_with_config():
+                finalize_online_quantized_weights_loading(model, model_config)
+            logger.info("Online quantization: finalize layerwise reload completed")
         elif use_standard_weight_load:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -282,6 +303,11 @@ class vLLMColocateWorkerExtension:
                 # Keep the draft model in sync when present.
                 if self._use_mtp_drafter_weight_sync():
                     load_quanted_weights(weights, self.model_runner, is_drafter=True)
+            elif is_online_quant_model(self.model_runner.vllm_config):
+                logger.info(f"Online quantized model detected (async): {self.model_runner.vllm_config.quant_config}")
+                for model in self._iter_all_models():
+                    loaded_params = model.load_weights(weights)
+                    logger.info(f"Online quantized weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 for model in self._iter_all_models():

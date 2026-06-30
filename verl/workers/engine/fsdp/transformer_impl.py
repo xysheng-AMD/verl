@@ -38,7 +38,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -541,6 +541,7 @@ class FSDPEngine(BaseEngine):
         logger.info(f"[QAT W4A4] Restored {loaded_count} input_global_scale/input_amax from {model_path}")
 
     def _build_model_optimizer(self):
+        print(f"[verl-debug] _build_model_optimizer called, strategy={self.engine_config.strategy} forward_only={getattr(self.engine_config, 'forward_only', 'N/A')}", flush=True)
         from verl.utils.model import print_model_size
 
         # Load base model with specified configuration and dtype
@@ -558,6 +559,10 @@ class FSDPEngine(BaseEngine):
         if self.rank == 0:
             print_model_size(module)
         log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
+
+        # Apply Lumen FP8 optimizations before FSDP wrapping
+        from verl.utils.fsdp_utils import _maybe_apply_lumen
+        _maybe_apply_lumen(module, forward_only=getattr(self.engine_config, "forward_only", False))
 
         # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
         log_gpu_memory_usage("Before FSDP", logger=None)
@@ -638,6 +643,13 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
+        # 每个 micro-batch 后 empty_cache + 跟踪 reserved 高水位。
+        # 由环境变量 VERL_EMPTY_CACHE_PER_MICRO_BATCH 控制（默认 "1" 开启）。
+        device = get_torch_device()
+        empty_cache_per_micro_batch = os.getenv("VERL_EMPTY_CACHE_PER_MICRO_BATCH", "1") == "1"
+        device_available = device.is_available()
+        max_reserved_bytes = 0
+
         for micro_batch in micro_batches:
             with ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
@@ -648,7 +660,17 @@ class FSDPEngine(BaseEngine):
                     else:
                         loss.backward()
 
+            if device_available:
+                max_reserved_bytes = max(max_reserved_bytes, device.memory_reserved())
+                if empty_cache_per_micro_batch:
+                    device.synchronize()
+                    device.empty_cache()
+
             output_lst.append(meta_info)
+
+        if device_available:
+            max_reserved_bytes = max(max_reserved_bytes, device.max_memory_reserved())
+        self._last_micro_batch_max_reserved_bytes = max_reserved_bytes
 
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -1108,7 +1130,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                                 v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                             model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
             else:
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                logits_rmpad = output.logits.squeeze(0).clone()  # (total_nnz, vocab_size)
                 logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)

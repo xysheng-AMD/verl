@@ -41,6 +41,7 @@ class FP8State:
     seen_params: set = field(default_factory=lambda: set())
     fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
+    fp8_per_block_patches: list = field(default_factory=lambda: [])
 
 
 fp8_state: FP8State = FP8State()
@@ -56,6 +57,70 @@ def is_fp8_model(vllm_config):
             return True
 
     return False
+
+
+def is_online_quant_model(vllm_config):
+    """Return whether vLLM is using online quantization such as fp8_per_block."""
+    try:
+        from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    except ImportError:
+        return False
+
+    return hasattr(vllm_config, "quant_config") and isinstance(vllm_config.quant_config, OnlineQuantizationConfig)
+
+
+def process_fp8_weight_block_strategy_rocm_safe(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """ROCm guard for online fp8_per_block.
+
+    On AMD, online fp8_per_block may already emit the platform FP8 dtype.
+    Only normalize e4m3fn to e4m3fnuz when the tensor is still e4m3fn.
+    """
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import _maybe_pad_fp8_weight
+    from vllm.model_executor.layers.quantization.utils.w8a8_utils import normalize_e4m3fn_to_e4m3fnuz
+    from vllm.platforms import current_platform
+
+    if current_platform.is_fp8_fnuz() and weight.dtype == torch.float8_e4m3fn:
+        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(weight=weight, weight_scale=weight_scale)
+
+    weight = _maybe_pad_fp8_weight(weight)
+    return weight, weight_scale
+
+
+def apply_vllm_fp8_per_block_patches():
+    """Patch vLLM online fp8_per_block for ROCm FP8 weight processing."""
+    if fp8_state.fp8_per_block_patches:
+        logger.debug("vLLM fp8_per_block patches already applied")
+        return
+
+    patchers = [
+        patch(
+            "vllm.model_executor.layers.quantization.utils.fp8_utils.process_fp8_weight_block_strategy",
+            process_fp8_weight_block_strategy_rocm_safe,
+        ),
+        patch(
+            "vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel.process_fp8_weight_block_strategy",
+            process_fp8_weight_block_strategy_rocm_safe,
+        ),
+    ]
+    for patcher in patchers:
+        patcher.start()
+    fp8_state.fp8_per_block_patches.extend(patchers)
+    logger.info("Applied vLLM fp8_per_block ROCm patches")
+
+
+def prepare_online_quantized_weights_for_loading(model):
+    from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+    initialize_layerwise_reload(model)
+
+
+def finalize_online_quantized_weights_loading(model, model_config):
+    from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
+
+    finalize_layerwise_reload(model, model_config)
 
 
 def get_module_from_param_name(model, name: str):

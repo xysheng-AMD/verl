@@ -282,6 +282,10 @@ class RolloutReplica(ABC):
         """reset kv cache in each rollout server."""
         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])
 
+    async def reset_deferred_state(self):
+        """Reset backend-specific deferred generation state in each rollout server."""
+        await asyncio.gather(*[server.reset_deferred_state.remote() for server in self.servers])
+
     async def release_kv_cache(self):
         """Release only the kv_cache GPU memory, keeping model weights in place."""
         await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
@@ -374,10 +378,17 @@ def _load_trtllm():
     return TRTLLMReplica
 
 
+def _load_atom():
+    from verl.workers.rollout.atom_rollout.atom_async_server import ATOMReplica
+
+    return ATOMReplica
+
+
 # Register built-in types
 RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
+RolloutReplicaRegistry.register("atom", _load_atom)
 
 
 def get_rollout_replica_class(rollout: str, disaggregation_enabled: bool = False) -> type[RolloutReplica]:

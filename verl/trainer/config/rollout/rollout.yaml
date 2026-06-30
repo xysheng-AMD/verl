@@ -1,7 +1,7 @@
 # Target class for this configuration
 _target_: verl.workers.config.RolloutConfig
 
-# actor_rollout_ref.rollout.name: hf/vllm/sglang/trtllm. The default value will be removed in the future
+# actor_rollout_ref.rollout.name: hf/vllm/sglang/trtllm/atom. The default value will be removed in the future
 name: ???
 
 # sync: LLM, async: AsyncLLM
@@ -127,7 +127,7 @@ over_sample_rate: 0
 # This is only effective for SGLang rollout.
 multi_stage_wake_up: false
 
-# Extra inference engine arguments (vllm, sglang, trtllm), please refer vllm/sglang/trtllm official doc for detail
+# Extra inference engine arguments (vllm, sglang, trtllm, atom), please refer engine docs for detail
 engine_kwargs:
 
   # vllm engine config
@@ -138,6 +138,15 @@ engine_kwargs:
 
   # trtllm engine config
   trtllm: {}
+
+  # atom engine config. Common overrides:
+  # kv_cache_dtype: bf16
+  # max_num_batched_tokens: ${actor_rollout_ref.rollout.max_num_batched_tokens}
+  # enable_prefix_caching: False
+  # compilation_config:
+  #   level: 3
+  # use_cuda_ipc: true  # verl-only weight sync switch; not passed to Atom engine
+  atom: {}
 
 # Sampling parameters used during validation.
 val_kwargs:

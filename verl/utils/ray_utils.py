@@ -25,6 +25,13 @@ from typing import Any, Optional
 import ray
 
 
+def _env_flag_enabled(value):
+    """只把明确为真的字符串视为开启；尤其 "0" 不能被当作 true。"""
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def ray_noset_visible_devices(env_vars=os.environ):
     # Refer to
     # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96
@@ -45,7 +52,7 @@ def ray_noset_visible_devices(env_vars=os.environ):
         "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
         "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
     ]
-    return any(env_vars.get(env_var) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
+    return any(_env_flag_enabled(env_vars.get(env_var)) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
 
 
 def parallel_put(data_list: list[Any], max_workers: Optional[int] = None):
